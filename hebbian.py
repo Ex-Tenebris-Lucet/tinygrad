@@ -105,7 +105,7 @@ class HebbianLayer:
                  weight_norm: float = 4.0,
                  target_sparsity: float = 0.05):    # Target for inhibition sparsity
         # Initialize weights with small positive values
-        bound = 1 / math.sqrt(in_features)
+        bound = 0.1 / math.sqrt(in_features)
         self.weight = Tensor.uniform(out_features, in_features, low=0, high=bound, requires_grad=False)
         
         # Initialize templates to zeros (clean slate for learning)
@@ -141,27 +141,15 @@ class HebbianLayer:
         winner_mask = (Tensor.arange(self.weight.shape[0]) == label).float().reshape(-1, 1)
         norm_act = norm_act.reshape(1, -1)  # Make x (1,784)
         
-        # Update templates for winner only (avoid expanding x unnecessarily)
-        if self.template_alpha > 0:  # Only do template updates if we're using them
-            # Normalize activations relative to winner's strength
-            out_norm = (out_act / out_act.max()).reshape(-1, 1)  # Shape (10,1)
-            
-            # Create mask for strongly activated non-winners
-            strong_mask = (out_norm > 0.3) & ~winner_mask
-            
-            # Update templates with both positive and counter-associative learning
-            self.templates = Tensor.where(
-                winner_mask,
-                # Winner: normal positive learning
-                self.templates * (1 - self.template_alpha) + norm_act * self.template_alpha,
-                Tensor.where(
-                    strong_mask,
-                    # Strong non-winners: add scaled difference to emphasize distinctions
-                    self.templates + ((self.templates - norm_act) * out_norm * self.template_alpha),
-                    # Weak non-winners: no change
-                    self.templates
-                )
-            ).realize()
+        counter_learning_mask = self._get_counter_learning_mask(out_act, winner_mask)
+        
+        # Update templates with both positive and counter-associative learning
+        self.templates = Tensor.where(
+            winner_mask,
+            # Winner: normal positive learning
+            self.templates * (1 - self.template_alpha) + norm_act * self.template_alpha,
+            self.templates + counter_learning_mask * (self.templates - norm_act) * self.template_alpha
+        ).realize()
         
         # Update weights for winner (same direct approach)
         self.weight = Tensor.where(
@@ -191,6 +179,13 @@ class HebbianLayer:
         
         # Apply both corrections
         self.weight = (squished + adjustment).realize()
+
+    def _get_counter_learning_mask(self, out_act: Tensor, winner_mask: Tensor) -> Tensor:
+        # Reshape everything to (10,1) for consistent broadcasting
+        out_norm = (out_act / out_act.max()).reshape(-1, 1)
+        strong_mask = (out_norm > 0.3).float() * (1 - winner_mask)
+        pattern_strength = ((self.weight.max(axis=1) - self.weight.min(axis=1)) / (self.weight_norm/2)).minimum(1.0).reshape(-1, 1)
+        return strong_mask * pattern_strength
 
     def _inhibition(self, raw_act: Tensor) -> tuple[Tensor, Tensor]:
         act_vol = raw_act.sum() #sum activations
@@ -231,4 +226,13 @@ class HebbianLayer:
         for i in range(10):
             row, col = i // 5, i % 5
             grid[row*28:(row+1)*28, col*28:(col+1)*28] = self.get_weight_image(i)
+        return grid
+
+    def visualize_all_templates(self) -> np.ndarray:
+        """Get all templates as a grid of 28x28 images."""
+        # Create a 2x5 grid of template patterns
+        grid = np.zeros((2*28, 5*28))
+        for i in range(10):
+            row, col = i // 5, i % 5
+            grid[row*28:(row+1)*28, col*28:(col+1)*28] = self.get_template_image(i)
         return grid
