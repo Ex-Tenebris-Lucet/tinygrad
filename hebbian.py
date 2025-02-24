@@ -99,20 +99,17 @@ Consider quantization for EMA buffers
 
 class HebbianLayer:
     def __init__(self, in_features: int, out_features: int, 
-                 learning_alpha: float = 0.2,  # How fast weights update 
+                 learning_alpha: float = 0.1,  # How fast weights update 
                  template_alpha: float = 0.1,  # How fast templates learn (faster than weights)
                  activity_alpha: float = 0.01,  # How fast activation history updates
-                 weight_norm: float = 4.0,
+                 weight_norm: float = 1.0,
                  target_sparsity: float = 0.05):    # Target for inhibition sparsity
         # Initialize weights with small positive values
         bound = 0.1 / math.sqrt(in_features)
-        self.weight = Tensor.uniform(out_features, in_features, low=0, high=bound, requires_grad=False)
+        self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound, requires_grad=False)
         
         # Initialize templates to zeros (clean slate for learning)
         self.templates = Tensor.zeros(out_features, in_features)
-        
-        # Normalize initial weights
-        self._normalize_neuron_weights(target_sum=weight_norm)
         
         # Parameters
         self.template_alpha = template_alpha  # How fast templates learn
@@ -139,52 +136,42 @@ class HebbianLayer:
             
         # Learning pass
         winner_mask = (Tensor.arange(self.weight.shape[0]) == label).float().reshape(-1, 1)
-        norm_act = norm_act.reshape(1, -1)  # Make x (1,784)
         
-        counter_learning_mask = self._get_counter_learning_mask(out_act, winner_mask)
+        counter_learning_mask = self._get_counter_learning_mask(out_act)
         
         # Update templates with both positive and counter-associative learning
         self.templates = Tensor.where(
             winner_mask,
             # Winner: normal positive learning
             self.templates * (1 - self.template_alpha) + norm_act * self.template_alpha,
-            self.templates + counter_learning_mask * (self.templates - norm_act) * self.template_alpha
+            # Counter learning for strong and wrong neurons
+            Tensor.where(
+                out_act.reshape(-1, 1) < 0.5,  # if weakly activated
+                self.templates,  # do nothing
+                self.templates - (norm_act * 0.1)  # gentle counter-learning, no fancy scaling
+            )
         ).realize()
         
-        # Update weights for winner (same direct approach)
+        # Update weights to follow templates
         self.weight = Tensor.where(
             winner_mask,
             self.weight + (self.templates - self.weight) * self.learning_alpha,
             self.weight
         ).realize()
         
-        # Normalize weights after update
-        self._normalize_neuron_weights(target_sum=self.weight_norm)
-        
         return out_act.realize()
 
-    def _normalize_neuron_weights(self, target_sum: float = 1.0, max_spread: float = 4.0):
-        # First check spread and squish if needed
-        spread = self.weight.max(axis=1) - self.weight.min(axis=1)  # Get spread for each neuron
-        squish_factor = (Tensor([max_spread]) / (spread + 1e-6)).minimum(1.0).reshape(-1, 1)
-        
-        # If spread too large, squish weights toward their mean
-        mean = self.weight.mean(axis=1, keepdim=True)
-        squished = mean + (self.weight - mean) * squish_factor
-        
-        # Then normalize sum (on squished weights)
-        weight_sums = squished.sum(axis=1).reshape(-1, 1)
-        difference = target_sum - weight_sums
-        adjustment = difference / self.weight.shape[1]
-        
-        # Apply both corrections
-        self.weight = (squished + adjustment).realize()
 
-    def _get_counter_learning_mask(self, out_act: Tensor, winner_mask: Tensor) -> Tensor:
+    def _normalize_templates(self, max_spread: float = 3.0):
+        templates_abs = self.templates.abs()
+        scale_factor = 1.0 / (1.0 + templates_abs/max_spread)  # Will be close to 1 for small values, smaller for large values
+        self.templates = (self.templates * scale_factor).realize()
+
+    def _get_counter_learning_mask(self, out_act: Tensor) -> Tensor:
         # Reshape everything to (10,1) for consistent broadcasting
         out_norm = (out_act / out_act.max()).reshape(-1, 1)
-        strong_mask = (out_norm > 0.3).float() * (1 - winner_mask)
-        pattern_strength = ((self.weight.max(axis=1) - self.weight.min(axis=1)) / (self.weight_norm/2)).minimum(1.0).reshape(-1, 1)
+        strong_mask = (out_norm > 0.5).float()
+        pattern_strength = ((self.weight.max(axis=1) - self.weight.min(axis=1)) / (self.weight_norm)).minimum(1.0).reshape(-1, 1)
         return strong_mask * pattern_strength
 
     def _inhibition(self, raw_act: Tensor) -> tuple[Tensor, Tensor]:
@@ -208,15 +195,33 @@ class HebbianLayer:
     def get_template_image(self, digit: int) -> np.ndarray:
         """Get a specific digit's template as a 28x28 image."""
         template = self.templates[digit].numpy()
-        # Normalize to 0-1 range for visualization
-        template = (template - template.min()) / (template.max() - template.min() + 1e-8)
+        
+        # Diagnostic information about value distribution
+        flat_template = template.flatten()
+        unique, counts = np.unique(flat_template, return_counts=True)
+        mode_value = unique[counts.argmax()]
+        print(f"Digit {digit} stats - Mode: {mode_value:.6f}, Min: {template.min():.6f}, Max: {template.max():.6f}")
+        
+        # Scale by the reciprocal of the largest magnitude value
+        max_magnitude = max(abs(template.max()), abs(template.min()))
+        if max_magnitude != 0:  # Only scale if we have non-zero values
+            template = template * (1.0 / max_magnitude)
         return template.reshape(28, 28)
     
     def get_weight_image(self, digit: int) -> np.ndarray:
         """Get a specific digit's weights as a 28x28 image."""
         weights = self.weight[digit].numpy()
-        # Normalize to 0-1 range for visualization
-        weights = (weights - weights.min()) / (weights.max() - weights.min() + 1e-8)
+        
+        # Diagnostic information about value distribution
+        flat_weights = weights.flatten()
+        unique, counts = np.unique(flat_weights, return_counts=True)
+        mode_value = unique[counts.argmax()]
+        print(f"Weight {digit} stats - Mode: {mode_value:.6f}, Min: {weights.min():.6f}, Max: {weights.max():.6f}")
+        
+        # Scale by the reciprocal of the largest magnitude value
+        max_magnitude = max(abs(weights.max()), abs(weights.min()))
+        if max_magnitude != 0:  # Only scale if we have non-zero values
+            weights = weights * (1.0 / max_magnitude)
         return weights.reshape(28, 28)
 
     def visualize_all_weights(self) -> np.ndarray:
